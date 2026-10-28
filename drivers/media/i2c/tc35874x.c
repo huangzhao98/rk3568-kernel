@@ -69,7 +69,8 @@ MODULE_LICENSE("GPL");
 #define I2C_MAX_XFER_SIZE  (EDID_BLOCK_SIZE + 2)
 
 #define POLL_INTERVAL_CEC_MS	10
-#define POLL_INTERVAL_MS	1000
+/* CCS 对标树莓派热拔插恢复速度：5V/时序变化检测 1000→200ms */
+#define POLL_INTERVAL_MS	200
 
 /* PIXEL_RATE = MIPI_FREQ * 2 * lane / 8bit */
 #define TC35874X_LINK_FREQ_310MHZ	310000000
@@ -212,6 +213,11 @@ struct tc35874x_state {
 
 	struct timer_list timer;
 	struct work_struct work_i2c_poll;
+	unsigned int poll_ticks;	/* 漏边恢复节流计数（见 work_i2c_poll） */
+
+	/* CCS HPD 门控：probe 后到首次开流前保持 HPD 拉低，不放行源端
+	 * （见 tc35874x_enable_edid 注释） */
+	bool hpd_gated;
 
 	/* edid  */
 	u8 edid_blocks_written;
@@ -594,6 +600,20 @@ static void tc35874x_enable_edid(struct v4l2_subdev *sd)
 
 	v4l2_dbg(2, debug, sd, "%s:\n", __func__);
 
+	/* CCS HPD 门控：冷启动时若源已在输出，芯片/链路会在随机相位建帧
+	 * （画面垂直卷动的根源），只能靠事后测量+重锁纠正（~20s）。门控
+	 * 期间不放行源端：HPD 保持拉低，源端视为显示器未就绪而停输出；
+	 * 等应用层首次开流（s_stream(1)，采集端已就绪）时才拉高 HPD 放行，
+	 * 源从帧边界重启输出，配合延迟解静音把相位钉 0——冷启动对齐
+	 * 从 ~20s 缩到开流后几秒。EDID 照常已写入、中断照常开，只是不
+	 * 调度 hotplug（不拉高 HPD）。源不理会 HPD 的场景：信号一直在，
+	 * 用户态走原有测量路径，不受门控影响。 */
+	if (state->hpd_gated) {
+		tc35874x_enable_interrupts(sd, true);
+		tc35874x_s_ctrl_detect_tx_5v(sd);
+		return;
+	}
+
 	/* Enable hotplug after 100 ms. DDC access to EDID is also enabled when
 	 * hotplug is enabled. See register DDC_CTL */
 	schedule_delayed_work(&state->delayed_work_enable_hotplug, HZ / 10);
@@ -728,12 +748,15 @@ static void tc35874x_self_reset(struct tc35874x_state *state)
 	state->i2c_errs = 0;
 }
 
-/* CCS 延迟解静音监控（自续 1Hz，开流期间常驻）：
+/* CCS 延迟解静音监控（自续轮询，开流期间常驻）：
  * VI_MUTE 解静音瞬间 CSI TX 会以当时的输入同步位置重建帧结构，
  * 若恰逢锁定瞬态的垃圾同步，相位就是随机的（画面垂直卷动的根源）。
  * 这里在失锁/未锁期间按住强制静音（AUTO_MUTE 不会在瞬态建帧），
- * 等 TMDS 连续锁定稳定 4s 后才解除强制静音，让帧结构在干净锁定下
- * 重建——实测相位收敛到常数 C0=0（2026-10-26，5/5）。 */
+ * 等 TMDS 连续锁定稳定 1s 后才解除强制静音，让帧结构在干净锁定下
+ * 重建——实测相位收敛到常数 C0=0（2026-10-26，5/5）。
+ * 2026-10-28 对标树莓派热拔插 1~2s 恢复：失锁/等锁期间轮询
+ * HZ→HZ/4，稳定等待 4s→1s（热拔插后源从帧头重新出图，1s 稳定
+ * 已足够确认干净锁定；开机的相位对齐有应用层机制兜底）。 */
 static void tc35874x_work_unmute(struct work_struct *work)
 {
 	struct tc35874x_state *state = container_of(to_delayed_work(work),
@@ -773,14 +796,14 @@ static void tc35874x_work_unmute(struct work_struct *work)
 		} else {
 			state->nosync_since = 0;
 		}
-		schedule_delayed_work(&state->work_unmute, HZ);
+		schedule_delayed_work(&state->work_unmute, HZ / 4);
 		return;
 	}
 	state->nosync_since = 0;
 	if (!state->lock_since)
 		state->lock_since = jiffies;
-	if (time_before(jiffies, state->lock_since + 4 * HZ)) {
-		schedule_delayed_work(&state->work_unmute, HZ / 2);
+	if (time_before(jiffies, state->lock_since + 1 * HZ)) {
+		schedule_delayed_work(&state->work_unmute, HZ / 4);
 		return;
 	}
 	if (i2c_rd8(sd, VI_MUTE) & MASK_VI_MUTE) {
@@ -807,10 +830,10 @@ static inline void enable_stream(struct v4l2_subdev *sd, bool enable)
 		/* CCS 延迟解静音：不立即解。锁定瞬态的同步位置是垃圾，
 		 * 此时建帧相位随机（卷动根源）。按住强制静音，交给
 		 * work_unmute 等锁定稳定后再解，相位钉回常数。
-		 * 信号可能早已锁好，4s 保守等待从此刻起算。 */
+		 * 信号可能早已锁好，1s 稳定等待从此刻起算。 */
 		i2c_wr8(sd, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
 		state->lock_since = jiffies;
-		schedule_delayed_work(&state->work_unmute, HZ / 2);
+		schedule_delayed_work(&state->work_unmute, HZ / 4);
 	} else {
 		/* Mute video so that all data lanes go to LSP11 state.
 		 * No data is output to CSI Tx block. */
@@ -823,6 +846,26 @@ static inline void enable_stream(struct v4l2_subdev *sd, bool enable)
 	i2c_wr16_and_or(sd, CONFCTL, ~(MASK_VBUFEN | MASK_ABUFEN),
 			enable ? (MASK_VBUFEN | MASK_ABUFEN) : 0x0);
 	mutex_unlock(&state->confctl_mutex);
+}
+
+/* CCS HPD 门控放行：应用层开始配置采集（set_fmt/s_stream(1)）即视为
+ * 采集端就绪，拉高 HPD 让源从帧边界重启输出（见 enable_edid 门控注释）。
+ * 不能只在 s_stream 放行：门控期间无信号可检测，state->timings 停在
+ * 默认 640x480，rkcif/v4l2src 配 720p 会因 subdev 时序不符协商失败，
+ * 流永远开不起来形成死锁（2026-10-28 实测 gst Internal data stream
+ * error）。set_fmt 放行后源 ~1-3s 出图，漏边轮询/中断把真实时序采进来，
+ * 协商即恢复；相位仍由开流时的延迟解静音钉 0，提前放行无害。 */
+static void tc35874x_hpd_gate_release(struct v4l2_subdev *sd)
+{
+	struct tc35874x_state *state = to_state(sd);
+
+	if (!state->hpd_gated)
+		return;
+	state->hpd_gated = false;
+	if (state->edid_blocks_written)
+		schedule_delayed_work(&state->delayed_work_enable_hotplug,
+				      HZ / 10);
+	v4l2_info(sd, "ccs: hpd gate released\n");
 }
 
 static void tc35874x_set_pll(struct v4l2_subdev *sd)
@@ -1671,9 +1714,30 @@ static void tc35874x_work_i2c_poll(struct work_struct *work)
 {
 	struct tc35874x_state *state = container_of(work,
 			struct tc35874x_state, work_i2c_poll);
+	struct v4l2_subdev *sd = &state->sd;
 	bool handled;
 
-	tc35874x_isr(&state->sd, 0, &handled);
+	tc35874x_isr(sd, 0, &handled);
+
+	/* CCS 漏边恢复：format_change 由 SYNC/DE 变化中断边沿触发。若芯片在
+	 * 驱动 probe 前已锁定（源一直在输出），之后全程无跳变就永远等不到
+	 * 边沿——state->timings 停在默认 640x480，链路格式被钳死，应用层
+	 * 按真实分辨率（如 720p）配流永远协商失败（2026-10-28 实测：开机前
+	 * 源已稳定输出时 gst 永久 Internal data stream error；开机没插线、
+	 * 之后插回同分辨率信号亦同）。轮询兜底：锁定状态下每 ~1s 比对一次
+	 * 检测时序与配置时序，不一致就补走 format_change（与中断路径同一
+	 * 入口，语义一致：失配 → enable_stream(false)+s_dv_timings 重编程，
+	 * 相位仍由延迟解静音钉定；一致则只读几个寄存器，无副作用）。
+	 * i2c 挂死时 no_signal/no_sync 为真直接跳过。 */
+	if (++state->poll_ticks >= 5) {
+		struct v4l2_dv_timings det;
+
+		state->poll_ticks = 0;
+		if (!no_signal(sd) && !no_sync(sd) &&
+		    !tc35874x_get_detected_timings(sd, &det) &&
+		    !v4l2_match_dv_timings(&state->timings, &det, 0, false))
+			tc35874x_format_change(sd);
+	}
 }
 
 static int tc35874x_subscribe_event(struct v4l2_subdev *sd, struct v4l2_fh *fh,
@@ -1820,6 +1884,11 @@ static int tc35874x_g_mbus_config(struct v4l2_subdev *sd,
 static int tc35874x_s_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct tc35874x_state *state = to_state(sd);
+
+	/* CCS HPD 门控放行：首次开流 = 采集端已就绪，此刻才拉高 HPD 让
+	 * 源从帧边界重启输出（见 enable_edid 门控注释）。 */
+	if (enable)
+		tc35874x_hpd_gate_release(sd);
 
 	/* CCS 实验：信号已锁且 TX 已在输出时不重启 TX。
 	 * VI_MUTE 解静音瞬间 CSI TX 会在输入帧随机位置重建帧结构，
@@ -1991,6 +2060,8 @@ static int tc35874x_set_fmt(struct v4l2_subdev *sd,
 
 	if (format->which == V4L2_SUBDEV_FORMAT_TRY)
 		return 0;
+
+	tc35874x_hpd_gate_release(sd);
 
 	state->mbus_fmt_code = format->format.code;
 
@@ -2551,6 +2622,10 @@ static int tc35874x_probe(struct i2c_client *client,
 	tc35874x_s_dv_timings(sd, &default_timing);
 
 	tc35874x_set_csi_color_space(sd);
+
+	/* CCS HPD 门控：从 probe 起按住源端，直到应用层首次开流才放行
+	 * （s_edid→enable_edid 会被门控拦截，HPD 保持拉低） */
+	state->hpd_gated = true;
 
 	def_edid.pad = 0;
 	def_edid.start_block = 0;
